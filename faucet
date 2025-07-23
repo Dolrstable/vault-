@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SepoliaFaucet {
+    address public owner;
+    uint256 public amountPerClaim = 0.01 ether;
+    uint256 public cooldown = 1 days;
+
+    mapping(address => uint256) public lastClaimed;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    // Allow funding the faucet
+    receive() external payable {}
+
+    // Claim function: 1 claim per 24 hours per wallet
+    function claim() external {
+        require(address(this).balance >= amountPerClaim, "Faucet is empty");
+        require(
+            block.timestamp - lastClaimed[msg.sender] >= cooldown,
+            "Wait 24h between claims"
+        );
+
+        lastClaimed[msg.sender] = block.timestamp;
+        payable(msg.sender).transfer(amountPerClaim);
+    }
+
+    // Admin: change amount
+    function setAmount(uint256 _amount) external onlyOwner {
+        amountPerClaim = _amount;
+    }
+
+    // Admin: change cooldown (in seconds)
+    function setCooldown(uint256 _cooldown) external onlyOwner {
+        cooldown = _cooldown;
+    }
+
+    // Admin: withdraw remaining ETH
+    function withdraw() external onlyOwner {
+        payable(owner).transfer(address(this).balance);
+    }
+
+    // View: check next claim time for a user
+    function nextClaimTime(address user) external view returns (uint256) {
+        return lastClaimed[user] + cooldown;
+    }
+}
