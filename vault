@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+//------------------------------------------
+// DOLR Stablecoin Token
+//------------------------------------------
+contract DOLR is ERC20 {
+    address public vaultManager;
+
+    constructor(address _vaultManager) ERC20("Decentralized Dollar", "DOLR") {
+        vaultManager = _vaultManager;
+    }
+
+    modifier onlyVault() {
+        require(msg.sender == vaultManager, "Only vault can mint/burn");
+        _;
+    }
+
+    function mint(address to, uint256 amount) external onlyVault {
+        _mint(to, amount);
+    }
+
+    function burn(address from, uint256 amount) external onlyVault {
+        _burn(from, amount);
+    }
+}
+
+//------------------------------------------
+// Vault Manager for Collateralized Borrowing
+//------------------------------------------
+contract VaultManager {
+    struct Vault {
+        uint256 collateral; // ETH in wei
+        uint256 debt;       // DOLR in wei
+    }
+
+    mapping(address => Vault) public vaults;
+
+    AggregatorV3Interface public ethUsdPriceFeed;
+    DOLR public dolr;
+    address public owner;
+
+    uint256 public constant COLLATERAL_RATIO = 16000; // 160% in basis points (bps)
+    uint256 public constant BPS_DIVISOR = 10000;
+
+    constructor(address _priceFeed) {
+        dolr = new DOLR(address(this));
+        ethUsdPriceFeed = AggregatorV3Interface(_priceFeed);
+        owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    function createVault(uint256 depositAmount, uint256 borrowAmount) external payable {
+        require(msg.value == depositAmount, "Invalid ETH deposit");
+        Vault storage v = vaults[msg.sender];
+
+        v.collateral += depositAmount;
+
+        if (borrowAmount > 0) {
+            uint256 ethUsd = getLatestPrice();
+            uint256 collateralUsd = (v.collateral * ethUsd) / 1e18;
+            uint256 maxBorrow = (collateralUsd * BPS_DIVISOR) / COLLATERAL_RATIO;
+            require(borrowAmount <= maxBorrow * 1e18, "Exceeds max borrow");
+
+            v.debt += borrowAmount;
+            dolr.mint(msg.sender, borrowAmount);
+        }
+    }
+
+    function deposit() external payable {
+        require(msg.value > 0, "No ETH sent");
+        vaults[msg.sender].collateral += msg.value;
+    }
+
+    function withdraw(uint256 amount) external {
+        Vault storage v = vaults[msg.sender];
+        require(v.collateral >= amount, "Not enough collateral");
+
+        uint256 ethUsd = getLatestPrice();
+        uint256 remainingCollateral = v.collateral - amount;
+        uint256 collateralUsd = (remainingCollateral * ethUsd) / 1e18;
+        uint256 requiredCollateralUsd = (v.debt * COLLATERAL_RATIO) / BPS_DIVISOR;
+
+        require(collateralUsd >= requiredCollateralUsd, "Would undercollateralize");
+
+        v.collateral -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
+    function borrow(uint256 amount) external {
+        Vault storage v = vaults[msg.sender];
+
+        uint256 ethUsd = getLatestPrice();
+        uint256 collateralUsd = (v.collateral * ethUsd) / 1e18;
+        uint256 maxBorrow = (collateralUsd * BPS_DIVISOR) / COLLATERAL_RATIO;
+
+        require(v.debt + amount <= maxBorrow * 1e18, "Exceeds borrow limit");
+
+        v.debt += amount;
+        dolr.mint(msg.sender, amount);
+    }
+
+    function repay(uint256 amount) external {
+        require(dolr.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        dolr.burn(address(this), amount);
+        Vault storage v = vaults[msg.sender];
+        require(v.debt >= amount, "Too much repay");
+        v.debt -= amount;
+    }
+
+    function liquidate(address user) external {
+        Vault storage v = vaults[user];
+        require(v.debt > 0, "No debt");
+
+        uint256 ethUsd = getLatestPrice();
+        uint256 collateralUsd = (v.collateral * ethUsd) / 1e18;
+        uint256 requiredCollateralUsd = (v.debt * COLLATERAL_RATIO) / BPS_DIVISOR;
+
+        require(collateralUsd < requiredCollateralUsd, "Vault is healthy");
+
+        // Liquidator repays debt and receives collateral with a discount
+        require(dolr.transferFrom(msg.sender, address(this), v.debt), "Transfer failed");
+        dolr.burn(address(this), v.debt);
+
+        uint256 seizedCollateral = (v.collateral * 90) / 100; // 10% discount
+        v.collateral = 0;
+        v.debt = 0;
+
+        payable(msg.sender).transfer(seizedCollateral);
+    }
+
+    function getVault(address user) external view returns (uint256 collateral, uint256 debt) {
+        Vault memory v = vaults[user];
+        return (v.collateral, v.debt);
+    }
+
+    function getLatestPrice() public view returns (uint256) {
+        (, int256 price,,,) = ethUsdPriceFeed.latestRoundData();
+        require(price > 0, "Invalid price");
+        return uint256(price) * 1e10; // Adjust to 18 decimals
+    }
+
+    function getDOLR() external view returns (address) {
+        return address(dolr);
+    }
+}
